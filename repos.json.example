@@ -1,0 +1,6 @@
+{
+  "my-repo": {
+    "token": "YOUR_REPOSITORY_ACCESS_TOKEN",
+    "filePatterns": ["**/*.ts", "**/*.js", "src/**"]
+  }
+}
