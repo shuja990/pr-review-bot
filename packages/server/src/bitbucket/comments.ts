@@ -84,3 +84,41 @@ export async function postBatchComments(
 
   return results;
 }
+
+// ─── Fetch all inline comments from a Bitbucket PR ──────────────────────────
+
+export interface BitbucketPRComment {
+  id: number;
+  content: { raw: string };
+  inline?: { path: string; to: number | null; from: number | null };
+  user: { display_name: string };
+}
+
+export async function getPRComments(
+  accessToken: string,
+  workspace: string,
+  repoSlug: string,
+  prId: number
+): Promise<BitbucketPRComment[]> {
+  const comments: BitbucketPRComment[] = [];
+  let url: string | undefined = `/repositories/${workspace}/${repoSlug}/pullrequests/${prId}/comments?pagelen=100`;
+
+  while (url) {
+    const data: { values: BitbucketPRComment[]; next?: string } = await bitbucketRequest({
+      accessToken,
+      path: url,
+    });
+
+    comments.push(...data.values);
+
+    if (data.next) {
+      const parsed = new URL(data.next);
+      url = parsed.pathname.replace(/^\/2\.0/, '') + parsed.search;
+    } else {
+      url = undefined;
+    }
+  }
+
+  // Only return inline comments (those attached to a file/line)
+  return comments.filter((c) => c.inline?.path);
+}

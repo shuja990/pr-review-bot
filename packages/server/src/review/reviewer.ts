@@ -307,6 +307,142 @@ export async function reviewPR(
   return reviewResult;
 }
 
+// ─── Verify Fixes ───────────────────────────────────────────────────────────
+
+export interface VerifyResult {
+  verified: { commentId: string; fixed: boolean; explanation: string; file_path: string; line: number; body: string }[];
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+}
+
+const verifyResultSchema = z.array(
+  z.object({
+    index: z.number(),
+    fixed: z.boolean(),
+    explanation: z.string(),
+  })
+);
+
+export async function verifyFixes(
+  accessToken: string,
+  workspace: string,
+  repoSlug: string,
+  prId: number,
+  comments: { id: string; file_path: string; line: number; body: string; severity: string }[]
+): Promise<VerifyResult> {
+  console.log(`[verifyFixes] Verifying ${comments.length} comments for ${workspace}/${repoSlug} PR #${prId}`);
+
+  // Group comments by file
+  const byFile = new Map<string, typeof comments>();
+  for (const c of comments) {
+    const arr = byFile.get(c.file_path);
+    if (arr) arr.push(c);
+    else byFile.set(c.file_path, [c]);
+  }
+
+  // Get current source code for each file
+  let sourceCommit: string | undefined;
+  try {
+    sourceCommit = await getPRSourceCommit(accessToken, workspace, repoSlug, prId);
+  } catch {
+    // fallback — proceed without
+  }
+
+  let totalInput = 0;
+  let totalOutput = 0;
+  const allResults: { commentId: string; fixed: boolean; explanation: string; file_path: string; line: number; body: string }[] = [];
+
+  const files = Array.from(byFile.entries());
+  for (let i = 0; i < files.length; i += CONCURRENCY) {
+    if (i > 0) await delay(BATCH_DELAY_MS);
+    const batch = files.slice(i, i + CONCURRENCY);
+
+    const batchResults = await Promise.all(
+      batch.map(async ([filePath, fileComments]) => {
+        // Fetch current file content
+        let currentContent: string | null = null;
+        if (sourceCommit) {
+          currentContent = await getFileContent(accessToken, workspace, repoSlug, sourceCommit, filePath);
+        }
+
+        // Also get current diff for this file
+        const rawDiff = await getRawDiff(accessToken, workspace, repoSlug, prId);
+
+        const commentsBlock = fileComments.map((c, idx) =>
+          `[${idx}] Line ${c.line} (${c.severity}): ${c.body}`
+        ).join('\n\n');
+
+        const system = `You are a code review verification assistant. You are given previous review comments and the current state of the code. For each comment, determine if the issue has been FIXED in the current code or if it still exists.
+
+Respond with a JSON array. Each element must have:
+- "index": the comment index number
+- "fixed": true if the issue is resolved, false if it still exists
+- "explanation": a brief one-sentence explanation
+
+Respond ONLY with the JSON array, no other text.`;
+
+        const userMsg = `File: ${filePath}
+
+${currentContent ? `Current file content:\n\`\`\`\n${currentContent.slice(0, 15000)}\n\`\`\`` : `Current diff:\n\`\`\`\n${rawDiff.slice(0, 15000)}\n\`\`\``}
+
+Previous review comments to verify:
+${commentsBlock}`;
+
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 4096,
+          system,
+          messages: [{ role: 'user', content: userMsg }],
+        });
+
+        const text = response.content[0].type === 'text' ? response.content[0].text : '';
+        totalInput += response.usage.input_tokens;
+        totalOutput += response.usage.output_tokens;
+
+        try {
+          let cleaned = text.trim()
+            .replace(/^```(?:json)?\s*\n?/m, '')
+            .replace(/\n?\s*```\s*$/m, '')
+            .trim();
+          const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+          if (!arrayMatch) return [];
+
+          const parsed = verifyResultSchema.parse(JSON.parse(arrayMatch[0]));
+          return parsed.map((r) => ({
+            commentId: fileComments[r.index]?.id,
+            fixed: r.fixed,
+            explanation: r.explanation,
+            file_path: fileComments[r.index]?.file_path ?? filePath,
+            line: fileComments[r.index]?.line ?? 0,
+            body: fileComments[r.index]?.body ?? '',
+          })).filter((r) => r.commentId);
+        } catch {
+          console.error(`[verifyFixes] Failed to parse response for ${filePath}`);
+          return [];
+        }
+      })
+    );
+
+    for (const results of batchResults) {
+      allResults.push(...results);
+    }
+  }
+
+  const costUsd =
+    (totalInput / 1_000_000) * INPUT_COST_PER_M +
+    (totalOutput / 1_000_000) * OUTPUT_COST_PER_M;
+
+  console.log(`[verifyFixes] Done — ${allResults.filter(r => r.fixed).length}/${allResults.length} fixed, $${costUsd.toFixed(4)}`);
+
+  return {
+    verified: allResults,
+    inputTokens: totalInput,
+    outputTokens: totalOutput,
+    costUsd,
+  };
+}
+
 export async function postSummaryComment(
   accessToken: string,
   workspace: string,

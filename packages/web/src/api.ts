@@ -99,6 +99,14 @@ async function authRequest<T>(path: string, opts?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export interface VerifyResult {
+  verified: { commentId: string; fixed: boolean; explanation: string; file_path: string; line: number; body: string }[];
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+  message?: string;
+}
+
 export const api = {
   // Auth
   getMe: () => authRequest<User>('/auth/me'),
@@ -151,4 +159,9 @@ export const api = {
     ),
 
   getStats: () => request<DashboardStats>('/reviews/stats'),
+
+  verifyFixes: (reviewId: string) =>
+    request<VerifyResult>(`/reviews/${encodeURIComponent(reviewId)}/verify`, {
+      method: 'POST',
+    }),
 };

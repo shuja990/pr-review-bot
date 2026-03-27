@@ -1,6 +1,7 @@
 import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { reviewPR, postSummaryComment } from '../review/reviewer.js';
+import { reviewPR, postSummaryComment, verifyFixes } from '../review/reviewer.js';
+import { getPRComments } from '../bitbucket/comments.js';
 import {
   createReview,
   createPendingReview,
@@ -309,4 +310,71 @@ reviewsRouter.patch('/:id/comments/:commentId/resolve', (req: Request<{ id: stri
     return;
   }
   res.json(comment);
+});
+
+// ─── Verify if comments have been fixed ─────────────────────────────────────
+
+reviewsRouter.post('/:id/verify', async (req: Request<{ id: string }>, res: Response) => {
+  try {
+    const token = await getAccessToken(req);
+    const review = getReviewById(req.params.id);
+    if (!review) {
+      res.status(404).json({ error: 'Review not found' });
+      return;
+    }
+
+    const [workspace, repoSlug] = review.repo_slug.includes('/')
+      ? review.repo_slug.split('/', 2)
+      : ['', review.repo_slug];
+
+    if (!workspace) {
+      res.status(400).json({ error: 'Review missing workspace info' });
+      return;
+    }
+
+    // Gather comments: use local DB comments + fetch inline comments from Bitbucket
+    const localComments = review.comments.map((c) => ({
+      id: c.id,
+      file_path: c.file_path,
+      line: c.line,
+      body: c.body,
+      severity: c.severity,
+    }));
+
+    const bbComments = await getPRComments(token, workspace, repoSlug, review.pr_id);
+    // Map Bitbucket comments, using their BB id as a string key, skip duplicates already in local DB
+    const localBbIds = new Set(review.comments.filter(c => c.bitbucket_comment_id).map(c => c.bitbucket_comment_id));
+    const externalComments = bbComments
+      .filter((c) => !localBbIds.has(c.id))
+      .map((c) => ({
+        id: `bb-${c.id}`,
+        file_path: c.inline!.path,
+        line: c.inline!.to ?? c.inline!.from ?? 0,
+        body: c.content.raw,
+        severity: 'info' as const,
+      }));
+
+    const commentsToVerify = [...localComments, ...externalComments];
+    if (commentsToVerify.length === 0) {
+      res.json({ verified: [], message: 'No comments to verify' });
+      return;
+    }
+
+    const result = await verifyFixes(
+      token, workspace, repoSlug, review.pr_id,
+      commentsToVerify
+    );
+
+    // Auto-resolve local comments that AI confirmed as fixed
+    for (const v of result.verified) {
+      if (v.fixed && !v.commentId.startsWith('bb-')) {
+        setCommentResolved(v.commentId, true);
+      }
+    }
+
+    res.json(result);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Unknown error';
+    res.status(400).json({ error: message });
+  }
 });

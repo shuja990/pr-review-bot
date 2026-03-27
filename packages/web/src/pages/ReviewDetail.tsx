@@ -26,6 +26,9 @@ export default function ReviewDetail() {
   const [editBody, setEditBody] = useState('');
   const [severityFilter, setSeverityFilter] = useState<SeverityFilter>('all');
   const [collapseResolved, setCollapseResolved] = useState(true);
+  const [verifying, setVerifying] = useState(false);
+  const [verifyResults, setVerifyResults] = useState<Map<string, { fixed: boolean; explanation: string }>>(new Map());
+  const [externalVerified, setExternalVerified] = useState<{ commentId: string; fixed: boolean; explanation: string; file_path: string; line: number; body: string }[]>([]);
 
   const load = useCallback(async () => {
     if (!id) return;
@@ -95,6 +98,32 @@ export default function ReviewDetail() {
     await updateComment(commentId, { body: editBody });
     setEditingId(null);
     setEditBody('');
+  };
+
+  const handleVerifyFixes = async () => {
+    if (!id) return;
+    setVerifying(true);
+    setVerifyResults(new Map());
+    setExternalVerified([]);
+    try {
+      const result = await api.verifyFixes(id);
+      const map = new Map<string, { fixed: boolean; explanation: string }>();
+      const external: typeof result.verified = [];
+      for (const v of result.verified) {
+        if (v.commentId.startsWith('bb-')) {
+          external.push(v);
+        } else {
+          map.set(v.commentId, { fixed: v.fixed, explanation: v.explanation });
+        }
+      }
+      setVerifyResults(map);
+      setExternalVerified(external);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Verification failed');
+    } finally {
+      setVerifying(false);
+    }
   };
 
   if (loading) {
@@ -248,6 +277,20 @@ export default function ReviewDetail() {
       {/* Actions + Filters */}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="flex gap-2">
+          <button
+            onClick={handleVerifyFixes}
+            disabled={verifying}
+            className="inline-flex items-center gap-1.5 bg-violet-600 text-white px-3.5 py-1.5 rounded-lg text-sm font-medium hover:bg-violet-700 disabled:opacity-50 transition-colors shadow-sm"
+          >
+            {verifying ? (
+              <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+            ) : (
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" />
+              </svg>
+            )}
+            {verifying ? 'Verifying…' : 'Verify Fixes'}
+          </button>
           {pendingCount > 0 && (
             <button
               onClick={handleApproveAll}
@@ -329,6 +372,7 @@ export default function ReviewDetail() {
                 <div className="divide-y divide-slate-100">
                   {visibleComments.map((c) => {
                     const sev = severityConfig[c.severity];
+                    const vr = verifyResults.get(c.id);
                     return (
                       <div key={c.id} className={`px-4 py-3 border-l-4 ${statusStyles[c.status]} transition-all`}>
                         <div className="flex items-center gap-2 mb-2">
@@ -351,6 +395,17 @@ export default function ReviewDetail() {
                               Resolved
                             </span>
                           ) : null}
+
+                          {vr && (
+                            <span className={`inline-flex items-center gap-1 text-xs font-medium ${vr.fixed ? 'text-green-600' : 'text-orange-600'}`} title={vr.explanation}>
+                              {vr.fixed ? (
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+                              ) : (
+                                <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
+                              )}
+                              {vr.fixed ? 'Fixed' : 'Not fixed'}
+                            </span>
+                          )}
 
                           <div className="ml-auto flex items-center gap-1">
                             {/* Resolve / Unresolve */}
@@ -423,6 +478,13 @@ export default function ReviewDetail() {
                         ) : (
                           <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{c.body}</p>
                         )}
+
+                        {vr && (
+                          <div className={`mt-2 px-3 py-2 rounded-lg text-xs ${vr.fixed ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-orange-50 text-orange-700 border border-orange-200'}`}>
+                            <span className="font-semibold">{vr.fixed ? '✓ Fixed:' : '✗ Not fixed:'}</span>{' '}
+                            {vr.explanation}
+                          </div>
+                        )}
                       </div>
                     );
                   })}
@@ -436,6 +498,53 @@ export default function ReviewDetail() {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Bitbucket PR comments verification results */}
+      {externalVerified.length > 0 && (
+        <div className="space-y-4">
+          <h3 className="text-sm font-semibold text-slate-700">Bitbucket PR Comments</h3>
+          {(() => {
+            const byFile = externalVerified.reduce<Record<string, typeof externalVerified>>((acc, v) => {
+              (acc[v.file_path] ??= []).push(v);
+              return acc;
+            }, {});
+            return Object.entries(byFile).map(([filePath, items]) => (
+              <div key={filePath} className="bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
+                <div className="bg-slate-50 px-4 py-2.5 border-b border-slate-100 flex items-center justify-between">
+                  <code className="text-sm font-medium text-slate-700">{filePath}</code>
+                  <span className="text-xs text-slate-400">{items.length} comment{items.length !== 1 ? 's' : ''}</span>
+                </div>
+                <div className="divide-y divide-slate-100">
+                  {items.map((v) => (
+                    <div key={v.commentId} className={`px-4 py-3 border-l-4 ${v.fixed ? 'border-l-green-400 bg-green-50/40' : 'border-l-orange-400 bg-orange-50/30'}`}>
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium ring-1 ring-inset bg-slate-50 text-slate-600 ring-slate-200">
+                          <span className="w-1.5 h-1.5 rounded-full bg-slate-400" />
+                          Bitbucket
+                        </span>
+                        <span className="text-xs text-slate-400 font-mono">L{v.line}</span>
+                        <span className={`inline-flex items-center gap-1 text-xs font-medium ${v.fixed ? 'text-green-600' : 'text-orange-600'}`}>
+                          {v.fixed ? (
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
+                          ) : (
+                            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-2.5L13.732 4.5c-.77-.833-2.694-.833-3.464 0L3.34 16.5c-.77.833.192 2.5 1.732 2.5z" /></svg>
+                          )}
+                          {v.fixed ? 'Fixed' : 'Not fixed'}
+                        </span>
+                      </div>
+                      <p className="text-sm text-slate-700 whitespace-pre-wrap leading-relaxed">{v.body}</p>
+                      <div className={`mt-2 px-3 py-2 rounded-lg text-xs ${v.fixed ? 'bg-green-50 text-green-700 border border-green-200' : 'bg-orange-50 text-orange-700 border border-orange-200'}`}>
+                        <span className="font-semibold">{v.fixed ? '✓ Fixed:' : '✗ Not fixed:'}</span>{' '}
+                        {v.explanation}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ));
+          })()}
         </div>
       )}
     </div>
